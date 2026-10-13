@@ -71,9 +71,12 @@ STEP_SCHEMA = {
     "properties": {
         "thought": {"type": "string"},
         "action": {"type": "string", "enum": ["search_knowledge", "final_answer"]},
+        # Enforces the tool's contract during decoding: at most 5 keywords, each
+        # a single word (no whitespace). Empty for final_answer, so no minItems.
         "keywords": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {"type": "string", "pattern": "^\\S+$"},
+            "maxItems": 5,
         },
         "answer": {"type": "string"},
     },
