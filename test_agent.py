@@ -2,6 +2,10 @@
 
 Run with `uv run deepeval test run test_agent.py`: the structured layer needs
 the per-test trace that DeepEval's pytest plugin sets up.
+
+Layers, cheapest first:
+1. structured: rule-based validation of the agent's tool calls
+2. fuzzy:      key-phrase matching of the answer (exact, RapidFuzz, BLEU/ROUGE)
 """
 
 from collections import Counter
@@ -12,13 +16,16 @@ import pytest
 from deepeval import assert_test
 from deepeval.dataset import EvaluationDataset, Golden
 from deepeval.metrics import ToolCorrectnessMetric
+from deepeval.test_case import LLMTestCase
 from deepeval.tracing import observe, update_current_span
 
 import agent
+from deepeval_fuzzy_util import FuzzyMatchMetric
 from deepeval_tool_util import ExpectedVerdictMetric, attach_tool_metrics, record_tools_called
 
 # Toggle each layer of evals.
 RUN_STRUCTURED_EVALS = True  # validation of the agent's tool calls, via @observe spans
+RUN_FUZZY_EVALS = True  # key-phrase matching of the answer: exact, RapidFuzz, BLEU/ROUGE
 
 GOLDENS_DIR = Path(__file__).parent / "goldens"
 
@@ -38,9 +45,15 @@ structured_pass_goldens = (
 structured_fail_goldens = (
     load_goldens("agent_structured_fail_goldens.json") if RUN_STRUCTURED_EVALS else []
 )
+# expected_output holds key phrases, one requirement per line, instead of a reference answer.
+fuzzy_pass_goldens = load_goldens("agent_fuzzy_pass_goldens.json") if RUN_FUZZY_EVALS else []
+fuzzy_fail_goldens = load_goldens("agent_fuzzy_fail_goldens.json") if RUN_FUZZY_EVALS else []
 
 # Failure modes each layer is expected to catch.
 STRUCTURED_FAILURE_MODES = ["fail_invalid_keywords", "fail_irrelevant_results", "fail_no_tool_call"]
+# Fuzzy matching checks which concepts an answer covers, not whether what it
+# says about them is true, so contradictions are left to the judge.
+FUZZY_FAILURE_MODES = ["fail_incomplete"]
 
 golden_set_pairs = {
     name: sets
@@ -50,6 +63,7 @@ golden_set_pairs = {
             (structured_pass_goldens, structured_fail_goldens, STRUCTURED_FAILURE_MODES),
             RUN_STRUCTURED_EVALS,
         ),
+        ("fuzzy", (fuzzy_pass_goldens, fuzzy_fail_goldens, FUZZY_FAILURE_MODES), RUN_FUZZY_EVALS),
     ]
     if enabled
 }
@@ -63,6 +77,7 @@ STRUCTURED_EXPECTED_OUTCOMES = {
 }
 
 skip_structured = pytest.mark.skipif(not RUN_STRUCTURED_EVALS, reason="RUN_STRUCTURED_EVALS is False")
+skip_fuzzy = pytest.mark.skipif(not RUN_FUZZY_EVALS, reason="RUN_FUZZY_EVALS is False")
 
 
 def golden_id(golden: Golden) -> str:
@@ -84,6 +99,16 @@ def run_agent(query: str, fresh: bool = False) -> str:
     if fresh or query not in _answers:
         _answers[query] = agent.answer_query(agent.make_client(), history=[], query=query)
     return _answers[query]
+
+
+def mocked_agent(golden: Golden):
+    """An agent that simulates the golden's failure mode by giving its incorrect answer."""
+
+    def answer(query: str) -> str:
+        assert query == golden.input
+        return golden.actual_output
+
+    return answer
 
 
 @observe(type="tool", name="search_knowledge")
@@ -119,6 +144,20 @@ def assert_tool_calls(golden: Golden) -> None:
     assert_test(golden=golden, metrics=[tool_correctness])
 
 
+def make_test_case(golden: Golden, actual_output: str) -> LLMTestCase:
+    return LLMTestCase(
+        input=golden.input,
+        actual_output=actual_output,
+        expected_output=golden.expected_output,
+        context=golden.context,
+    )
+
+
+def assert_fuzzy_match(golden: Golden, actual_output: str) -> None:
+    expected_pass = golden.additional_metadata["expected_verdict"] == "pass"
+    assert_test(make_test_case(golden, actual_output), [FuzzyMatchMetric(expected_pass=expected_pass)])
+
+
 @pytest.mark.parametrize(
     "pass_goldens, fail_goldens, failure_modes",
     list(golden_set_pairs.values()),
@@ -150,3 +189,19 @@ def test_agent_tool_calls(golden: Golden):
 def test_mocked_agent_tool_calls(golden: Golden):
     replay_tool_calls(golden)
     assert_tool_calls(golden)
+
+
+# Fuzzy matching of the answer. Defined after the structured tests, which run
+# first and fill the answer cache, so the agent answers each query only once.
+
+
+@skip_fuzzy
+@pytest.mark.parametrize("golden", fuzzy_pass_goldens, ids=golden_id)
+def test_agent_fuzzy(golden: Golden):
+    assert_fuzzy_match(golden, run_agent(golden.input))
+
+
+@skip_fuzzy
+@pytest.mark.parametrize("golden", fuzzy_fail_goldens, ids=golden_id)
+def test_mocked_agent_failures_fuzzy(golden: Golden):
+    assert_fuzzy_match(golden, mocked_agent(golden)(golden.input))
