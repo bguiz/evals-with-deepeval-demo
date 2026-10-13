@@ -1,16 +1,22 @@
-"""Evals for agent.py, one layer at a time.
+"""Evals for agent.py, grouped by query and run as a sequence of layers.
 
 Run with `uv run deepeval test run test_agent.py`: the structured layer needs
 the per-test trace that DeepEval's pytest plugin sets up.
 
-Layers, cheapest first:
+Each query has goldens in every enabled layer, run in this order, cheapest first:
 1. structured: rule-based validation of the agent's tool calls
 2. fuzzy:      key-phrase matching of the answer (exact, RapidFuzz, BLEU/ROUGE)
 3. judge:      Jev checks the answer against a reference answer, one API call per test
+
+Within a layer, the live agent is expected to pass, and mocked agents that
+simulate each failure mode are expected to be caught. With SEQUENCE_FAIL_FAST,
+once any test in a layer fails for a query, that query's later layers are skipped.
 """
 
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -30,6 +36,8 @@ from deepeval_tool_util import ExpectedVerdictMetric, attach_tool_metrics, recor
 RUN_STRUCTURED_EVALS = True  # validation of the agent's tool calls, via @observe spans
 RUN_FUZZY_EVALS = True  # key-phrase matching of the answer: exact, RapidFuzz, BLEU/ROUGE
 RUN_JEV_EVALS = True  # the judge: Jev compares the answer with a reference answer
+# Once a layer fails for a query, skip that query's later layers.
+SEQUENCE_FAIL_FAST = True
 
 GOLDENS_DIR = Path(__file__).parent / "goldens"
 
@@ -39,43 +47,6 @@ def load_goldens(file_name: str) -> list[Golden]:
     dataset.add_goldens_from_json_file(str(GOLDENS_DIR / file_name))
     return dataset.goldens
 
-
-# Each layer has expected passes, run by the live agent, and expected failures,
-# run by a mocked agent. Only the golden sets of enabled layers are loaded; a
-# disabled layer's tests get an empty parameter list and are skipped.
-structured_pass_goldens = (
-    load_goldens("agent_structured_pass_goldens.json") if RUN_STRUCTURED_EVALS else []
-)
-structured_fail_goldens = (
-    load_goldens("agent_structured_fail_goldens.json") if RUN_STRUCTURED_EVALS else []
-)
-# expected_output holds key phrases, one requirement per line, instead of a reference answer.
-fuzzy_pass_goldens = load_goldens("agent_fuzzy_pass_goldens.json") if RUN_FUZZY_EVALS else []
-fuzzy_fail_goldens = load_goldens("agent_fuzzy_fail_goldens.json") if RUN_FUZZY_EVALS else []
-# expected_output holds a reference answer.
-jev_pass_goldens = load_goldens("agent_judge_pass_goldens.json") if RUN_JEV_EVALS else []
-jev_fail_goldens = load_goldens("agent_judge_fail_goldens.json") if RUN_JEV_EVALS else []
-
-# Failure modes each layer is expected to catch.
-STRUCTURED_FAILURE_MODES = ["fail_invalid_keywords", "fail_irrelevant_results", "fail_no_tool_call"]
-# Fuzzy matching checks which concepts an answer covers, not whether what it
-# says about them is true, so contradictions are left to the judge.
-FUZZY_FAILURE_MODES = ["fail_incomplete"]
-JEV_FAILURE_MODES = ["fail_contradiction", "fail_incomplete"]
-
-golden_set_pairs = {
-    name: sets
-    for name, sets, enabled in [
-        (
-            "structured",
-            (structured_pass_goldens, structured_fail_goldens, STRUCTURED_FAILURE_MODES),
-            RUN_STRUCTURED_EVALS,
-        ),
-        ("fuzzy", (fuzzy_pass_goldens, fuzzy_fail_goldens, FUZZY_FAILURE_MODES), RUN_FUZZY_EVALS),
-        ("judge", (jev_pass_goldens, jev_fail_goldens, JEV_FAILURE_MODES), RUN_JEV_EVALS),
-    ]
-    if enabled
-}
 
 # Whether each metric should pass for each scenario; None means not checked.
 STRUCTURED_EXPECTED_OUTCOMES = {
@@ -109,24 +80,13 @@ EXPECTED_OUTCOMES = {
     "fail_incomplete": {"No contradiction": True, "Completeness": False},
 }
 
-skip_structured = pytest.mark.skipif(not RUN_STRUCTURED_EVALS, reason="RUN_STRUCTURED_EVALS is False")
-skip_fuzzy = pytest.mark.skipif(not RUN_FUZZY_EVALS, reason="RUN_FUZZY_EVALS is False")
-skip_jev = pytest.mark.skipif(not RUN_JEV_EVALS, reason="RUN_JEV_EVALS is False")
-
-
-def golden_id(golden: Golden) -> str:
-    meta = golden.additional_metadata
-    return f"q{meta['question_id']}-{meta['scenario']}"
-
-
 _answers: dict[str, str] = {}
 
 
 def run_agent(query: str, fresh: bool = False) -> str:
     """agent.py's answer to a single query, with no earlier conversation.
 
-    Answers are cached, so each query is answered once per run even when
-    several layers use it. `fresh=True` always runs the agent, which the
+    Answers are cached, so later layers evaluate the same run as earlier ones. `fresh=True` always runs the agent, which the
     structured layer needs: a cached answer records no spans in the current
     test's trace.
     """
@@ -208,66 +168,139 @@ def assert_jev_correctness(golden: Golden, actual_output: str) -> None:
     assert_test(make_test_case(golden, actual_output), metrics)
 
 
-@pytest.mark.parametrize(
-    "pass_goldens, fail_goldens, failure_modes",
-    list(golden_set_pairs.values()),
-    ids=list(golden_set_pairs),
-)
-def test_golden_sets_aligned(
-    pass_goldens: list[Golden], fail_goldens: list[Golden], failure_modes: list[str]
-):
-    """Every pass query appears exactly once per failure mode in the fail set."""
-    pass_inputs = Counter(g.input for g in pass_goldens)
-    assert all(n == 1 for n in pass_inputs.values()), "duplicate queries in the pass set"
-    fail_pairs = Counter((g.input, g.additional_metadata["scenario"]) for g in fail_goldens)
-    assert fail_pairs == Counter({(i, s): 1 for i in pass_inputs for s in failure_modes})
+def answer_for(golden: Golden) -> str:
+    """The live agent's answer for a pass golden, a mocked agent's otherwise."""
+    if golden.additional_metadata["scenario"] == "pass":
+        return run_agent(golden.input)
+    return mocked_agent(golden)(golden.input)
 
 
-# Structured validation of tool calls
+# Each layer's runner: run one golden through the layer, raising if it fails.
 
 
-@skip_structured
-@pytest.mark.parametrize("golden", structured_pass_goldens, ids=golden_id)
-def test_agent_tool_calls(golden: Golden):
-    # Runs inside the test's DeepEval trace, so the agent's spans are recorded there.
-    run_agent(golden.input, fresh=True)
+def run_structured(golden: Golden) -> None:
+    # Runs inside the test's DeepEval trace, so the agent's spans are recorded
+    # there. The live agent runs fresh, and fills the answer cache for the
+    # later layers.
+    if golden.additional_metadata["scenario"] == "pass":
+        run_agent(golden.input, fresh=True)
+    else:
+        replay_tool_calls(golden)
     assert_tool_calls(golden)
 
 
-@skip_structured
-@pytest.mark.parametrize("golden", structured_fail_goldens, ids=golden_id)
-def test_mocked_agent_tool_calls(golden: Golden):
-    replay_tool_calls(golden)
-    assert_tool_calls(golden)
+def run_fuzzy(golden: Golden) -> None:
+    assert_fuzzy_match(golden, answer_for(golden))
 
 
-# Fuzzy matching of the answer. Defined after the structured tests, which run
-# first and fill the answer cache, so the agent answers each query only once.
+def run_judge(golden: Golden) -> None:
+    assert_jev_correctness(golden, answer_for(golden))
 
 
-@skip_fuzzy
-@pytest.mark.parametrize("golden", fuzzy_pass_goldens, ids=golden_id)
-def test_agent_fuzzy(golden: Golden):
-    assert_fuzzy_match(golden, run_agent(golden.input))
+@dataclass(frozen=True)
+class Stage:
+    """One layer of evals."""
+
+    name: str
+    enabled: bool
+    pass_file: str
+    fail_file: str
+    failure_modes: tuple[str, ...]  # failure modes this layer is expected to catch
+    run: Callable[[Golden], None]
 
 
-@skip_fuzzy
-@pytest.mark.parametrize("golden", fuzzy_fail_goldens, ids=golden_id)
-def test_mocked_agent_failures_fuzzy(golden: Golden):
-    assert_fuzzy_match(golden, mocked_agent(golden)(golden.input))
+# In sequence order: cheapest first, and the judge last as the final arbiter.
+# Fuzzy matching checks which concepts an answer covers, not whether what it
+# says about them is true, so contradictions are left to the judge.
+STAGES = [
+    Stage(
+        "structured",
+        RUN_STRUCTURED_EVALS,
+        "agent_structured_pass_goldens.json",
+        "agent_structured_fail_goldens.json",
+        ("fail_invalid_keywords", "fail_irrelevant_results", "fail_no_tool_call"),
+        run_structured,
+    ),
+    Stage(
+        "fuzzy",
+        RUN_FUZZY_EVALS,
+        # expected_output holds key phrases, one requirement per line.
+        "agent_fuzzy_pass_goldens.json",
+        "agent_fuzzy_fail_goldens.json",
+        ("fail_incomplete",),
+        run_fuzzy,
+    ),
+    Stage(
+        "judge",
+        RUN_JEV_EVALS,
+        # expected_output holds a reference answer.
+        "agent_judge_pass_goldens.json",
+        "agent_judge_fail_goldens.json",
+        ("fail_contradiction", "fail_incomplete"),
+        run_judge,
+    ),
+]
+ENABLED_STAGES = [stage for stage in STAGES if stage.enabled]
 
 
-# The judge. Defined last: it's the slowest and costliest layer, and by now
-# the answer cache is full.
+@dataclass(frozen=True)
+class EvalCase:
+    stage: Stage
+    golden: Golden
+
+    @property
+    def query(self) -> str:
+        return self.golden.input
+
+    @property
+    def scenario(self) -> str:
+        return self.golden.additional_metadata["scenario"]
 
 
-@skip_jev
-@pytest.mark.parametrize("golden", jev_pass_goldens, ids=golden_id)
-def test_agent_jev(golden: Golden):
-    assert_jev_correctness(golden, run_agent(golden.input))
+def load_query_groups() -> dict[str, list[EvalCase]]:
+    """Each query's eval cases, in sequence order: by layer, then the pass
+    golden before the failures. Only the golden sets of enabled layers are loaded."""
+    groups: dict[str, list[EvalCase]] = {}
+    for stage in ENABLED_STAGES:
+        for golden in load_goldens(stage.pass_file) + load_goldens(stage.fail_file):
+            groups.setdefault(golden.input, []).append(EvalCase(stage, golden))
+    return groups
 
 
-@skip_jev
-@pytest.mark.parametrize("golden", jev_fail_goldens, ids=golden_id)
-def test_mocked_agent_failures_jev(golden: Golden):
-    assert_jev_correctness(golden, mocked_agent(golden)(golden.input))
+QUERY_GROUPS = load_query_groups()
+# pytest runs parametrised cases in list order, so each query's sequence runs together.
+EVAL_CASES = [case for cases in QUERY_GROUPS.values() for case in cases]
+
+# Query -> the layer that failed first for it.
+_failed_stages: dict[str, str] = {}
+
+
+def case_id(case: EvalCase) -> str:
+    return f"q{case.golden.additional_metadata['question_id']}-{case.stage.name}-{case.scenario}"
+
+
+def query_id(query: str) -> str:
+    return f"q{QUERY_GROUPS[query][0].golden.additional_metadata['question_id']}"
+
+
+@pytest.mark.parametrize("query", list(QUERY_GROUPS), ids=query_id)
+def test_query_group_complete(query: str):
+    """In every enabled layer, the query has one pass golden, and one golden
+    per failure mode that layer is expected to catch."""
+    scenarios = Counter((case.stage.name, case.scenario) for case in QUERY_GROUPS[query])
+    expected = Counter(
+        {(stage.name, s): 1 for stage in ENABLED_STAGES for s in ("pass",) + stage.failure_modes}
+    )
+    assert scenarios == expected
+
+
+@pytest.mark.parametrize("case", EVAL_CASES, ids=case_id)
+def test_eval(case: EvalCase):
+    failed_stage = _failed_stages.get(case.query)
+    if SEQUENCE_FAIL_FAST and failed_stage and failed_stage != case.stage.name:
+        pytest.skip(f"the {failed_stage} layer failed for this query")
+    try:
+        case.stage.run(case.golden)
+    except Exception:
+        _failed_stages.setdefault(case.query, case.stage.name)
+        raise
