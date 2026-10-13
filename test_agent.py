@@ -6,6 +6,7 @@ the per-test trace that DeepEval's pytest plugin sets up.
 Layers, cheapest first:
 1. structured: rule-based validation of the agent's tool calls
 2. fuzzy:      key-phrase matching of the answer (exact, RapidFuzz, BLEU/ROUGE)
+3. judge:      Jev checks the answer against a reference answer, one API call per test
 """
 
 from collections import Counter
@@ -15,17 +16,20 @@ import pytest
 
 from deepeval import assert_test
 from deepeval.dataset import EvaluationDataset, Golden
-from deepeval.metrics import ToolCorrectnessMetric
-from deepeval.test_case import LLMTestCase
+from deepeval.metrics import JevEval, ToolCorrectnessMetric
+from deepeval.metrics.jev_eval import Noul, Score
+from deepeval.test_case import LLMTestCase, SingleTurnParams
 from deepeval.tracing import observe, update_current_span
 
 import agent
 from deepeval_fuzzy_util import FuzzyMatchMetric
+from deepeval_jev_util import JevQuestionMetric, SharedJevDecision
 from deepeval_tool_util import ExpectedVerdictMetric, attach_tool_metrics, record_tools_called
 
 # Toggle each layer of evals.
 RUN_STRUCTURED_EVALS = True  # validation of the agent's tool calls, via @observe spans
 RUN_FUZZY_EVALS = True  # key-phrase matching of the answer: exact, RapidFuzz, BLEU/ROUGE
+RUN_JEV_EVALS = True  # the judge: Jev compares the answer with a reference answer
 
 GOLDENS_DIR = Path(__file__).parent / "goldens"
 
@@ -48,12 +52,16 @@ structured_fail_goldens = (
 # expected_output holds key phrases, one requirement per line, instead of a reference answer.
 fuzzy_pass_goldens = load_goldens("agent_fuzzy_pass_goldens.json") if RUN_FUZZY_EVALS else []
 fuzzy_fail_goldens = load_goldens("agent_fuzzy_fail_goldens.json") if RUN_FUZZY_EVALS else []
+# expected_output holds a reference answer.
+jev_pass_goldens = load_goldens("agent_judge_pass_goldens.json") if RUN_JEV_EVALS else []
+jev_fail_goldens = load_goldens("agent_judge_fail_goldens.json") if RUN_JEV_EVALS else []
 
 # Failure modes each layer is expected to catch.
 STRUCTURED_FAILURE_MODES = ["fail_invalid_keywords", "fail_irrelevant_results", "fail_no_tool_call"]
 # Fuzzy matching checks which concepts an answer covers, not whether what it
 # says about them is true, so contradictions are left to the judge.
 FUZZY_FAILURE_MODES = ["fail_incomplete"]
+JEV_FAILURE_MODES = ["fail_contradiction", "fail_incomplete"]
 
 golden_set_pairs = {
     name: sets
@@ -64,6 +72,7 @@ golden_set_pairs = {
             RUN_STRUCTURED_EVALS,
         ),
         ("fuzzy", (fuzzy_pass_goldens, fuzzy_fail_goldens, FUZZY_FAILURE_MODES), RUN_FUZZY_EVALS),
+        ("judge", (jev_pass_goldens, jev_fail_goldens, JEV_FAILURE_MODES), RUN_JEV_EVALS),
     ]
     if enabled
 }
@@ -76,8 +85,33 @@ STRUCTURED_EXPECTED_OUTCOMES = {
     "fail_no_tool_call": {"Tool call validation": None, "Tool correctness": False},
 }
 
+# (metric name, Jev question). All questions go to Jev in a single call, and
+# each one is reported as its own metric.
+QUESTIONS = [
+    (
+        "No contradiction",
+        Noul("No fact in actual_output contradicts a fact in expected_output."),
+    ),
+    (
+        "Completeness",
+        Score(
+            "How much of the detail in expected_output is present in actual_output?",
+            levels=["Almost none", "Some", "Most", "All of it"],
+        ),
+    ),
+]
+
+# Whether each judge metric should pass for each scenario. A metric missing
+# from a scenario is reported with its score, but doesn't decide pass/fail.
+EXPECTED_OUTCOMES = {
+    "pass": {"No contradiction": True, "Completeness": True},
+    "fail_contradiction": {"No contradiction": False},
+    "fail_incomplete": {"No contradiction": True, "Completeness": False},
+}
+
 skip_structured = pytest.mark.skipif(not RUN_STRUCTURED_EVALS, reason="RUN_STRUCTURED_EVALS is False")
 skip_fuzzy = pytest.mark.skipif(not RUN_FUZZY_EVALS, reason="RUN_FUZZY_EVALS is False")
+skip_jev = pytest.mark.skipif(not RUN_JEV_EVALS, reason="RUN_JEV_EVALS is False")
 
 
 def golden_id(golden: Golden) -> str:
@@ -158,6 +192,22 @@ def assert_fuzzy_match(golden: Golden, actual_output: str) -> None:
     assert_test(make_test_case(golden, actual_output), [FuzzyMatchMetric(expected_pass=expected_pass)])
 
 
+def assert_jev_correctness(golden: Golden, actual_output: str) -> None:
+    decision = SharedJevDecision(
+        JevEval(
+            name="Correctness",
+            evaluation_params=[SingleTurnParams.ACTUAL_OUTPUT, SingleTurnParams.EXPECTED_OUTPUT],
+            questions=[question for _, question in QUESTIONS],
+        )
+    )
+    expected = EXPECTED_OUTCOMES[golden.additional_metadata["scenario"]]
+    metrics = [
+        JevQuestionMetric(decision, i, name, expected_pass=expected.get(name))
+        for i, (name, _) in enumerate(QUESTIONS)
+    ]
+    assert_test(make_test_case(golden, actual_output), metrics)
+
+
 @pytest.mark.parametrize(
     "pass_goldens, fail_goldens, failure_modes",
     list(golden_set_pairs.values()),
@@ -205,3 +255,19 @@ def test_agent_fuzzy(golden: Golden):
 @pytest.mark.parametrize("golden", fuzzy_fail_goldens, ids=golden_id)
 def test_mocked_agent_failures_fuzzy(golden: Golden):
     assert_fuzzy_match(golden, mocked_agent(golden)(golden.input))
+
+
+# The judge. Defined last: it's the slowest and costliest layer, and by now
+# the answer cache is full.
+
+
+@skip_jev
+@pytest.mark.parametrize("golden", jev_pass_goldens, ids=golden_id)
+def test_agent_jev(golden: Golden):
+    assert_jev_correctness(golden, run_agent(golden.input))
+
+
+@skip_jev
+@pytest.mark.parametrize("golden", jev_fail_goldens, ids=golden_id)
+def test_mocked_agent_failures_jev(golden: Golden):
+    assert_jev_correctness(golden, mocked_agent(golden)(golden.input))

@@ -62,9 +62,13 @@ Search before answering any question about AI engineering, unless the relevant
 passages are already present in this conversation. Base your answers on the
 knowledge base. If it does not cover the question, say so rather than guessing.
 
+If a search matches nothing, search again before giving up: split hyphenated
+terms into separate words, and try other spellings and word forms, e.g.
+"summarisation" for "summarization", or a shorter stem such as "summar".
+
 If any query is not found in the results of "search_knowledge", answer exactly "Sorry I cannot help with that."
 
-Keep answers concise: 2-5 sentences, in plain text."""
+Answer in plain text, in 3-6 sentences that cover every relevant detail from the search results."""
 
 STEP_SCHEMA = {
     "type": "object",
